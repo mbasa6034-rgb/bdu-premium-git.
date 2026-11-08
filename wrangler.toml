@@ -1,0 +1,19 @@
+name = "bdu-premium-git"
+main = "bdu-premium-worker.js"
+compatibility_date = "2026-01-01"
+
+# D1 database. Create it once with:  npx wrangler d1 create bdu-premium
+# then paste the database_id it prints below.
+[[d1_databases]]
+binding = "DB"
+database_name = "bdu-premium"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+# Comma-separated list of front-end origins allowed to call the API.
+ALLOWED_ORIGINS = "https://bdu-premium.pages.dev"
+
+# Secrets (set with `npx wrangler secret put NAME`, never put them here):
+#   TELEGRAM_BOT_TOKEN        from @BotFather
+#   TELEGRAM_ADMIN_IDS        your Telegram numeric ID(s), comma-separated
+#   TELEGRAM_WEBHOOK_SECRET   any long random text you invent
