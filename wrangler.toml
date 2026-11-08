@@ -6,12 +6,12 @@ compatibility_date = "2026-01-01"
 # then paste the database_id it prints below.
 [[d1_databases]]
 binding = "DB"
-database_name = "bdu-premium"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_name = "bdu-premiumm"
+database_id = "7e66f83e-4225-4e0e-bfe0-956a3505eb2c"
 
 [vars]
 # Comma-separated list of front-end origins allowed to call the API.
-ALLOWED_ORIGINS = "https://bdu-premium.pages.dev"
+ALLOWED_ORIGINS = "https://bdu-premiumm.pages.dev"
 
 # Secrets (set with `npx wrangler secret put NAME`, never put them here):
 #   TELEGRAM_BOT_TOKEN        from @BotFather
