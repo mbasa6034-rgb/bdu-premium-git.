@@ -69,160 +69,6 @@ async function getUserFromRequest(db, request) {
   return { id: row.id, full_name: row.full_name, university: row.university, campus: row.campus, phone: row.phone };
 }
 
-async function deleteSession(db, request) {
-  const auth = request.headers.get('Authorization') || '';
-  const match = auth.match(/^Bearer\s+([a-f0-9]{64})$/i);
-  if (!match) return;
-  await db.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(await sha256Hex(match[1])).run();
-}
-
-async function sha256Hex(text) {
-  return toHex(await crypto.subtle.digest('SHA-256', enc.encode(text)));
-}
-
-// Simple fixed-window rate limiter stored in D1.
-// Returns true if the action is allowed, false if the limit is exceeded.
-async function allowRequest(db, bucket, limit, windowSeconds) {
-  const now = Math.floor(Date.now() / 1000);
-  const row = await db.prepare('SELECT count, window_start FROM rate_limits WHERE bucket = ?')
-    .bind(bucket).first();
-  if (!row || now - row.window_start >= windowSeconds) {
-    await db.prepare(
-      'INSERT INTO rate_limits (bucket, count, window_start) VALUES (?, 1, ?) ' +
-      'ON CONFLICT(bucket) DO UPDATE SET count = 1, window_start = excluded.window_start'
-    ).bind(bucket, now).run();
-    return true;
-  }
-  if (row.count >= limit) return false;
-  await db.prepare('UPDATE rate_limits SET count = count + 1 WHERE bucket = ?').bind(bucket).run();
-  return true;
-}
-
-// Ethiopian phone numbers: 09XXXXXXXX or 07XXXXXXXX, or +2519/+2517 forms.
-// Returns normalized +251XXXXXXXXX or null if invalid.
-function normalizePhone(input) {
-  const digits = String(input || '').replace(/[\s-]/g, '');
-  let m = digits.match(/^(?:\+?251|0)?([79]\d{8})$/);
-  return m ? `+251${m[1]}` : null;
-}
-
-// BDU PREMIUM — Telegram helper (Phase 2: payment review)
-// The bot token lives only in Cloudflare secrets (env.TELEGRAM_BOT_TOKEN).
-
-function api(env, method) {
-  return `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`;
-}
-
-function isAdmin(env, telegramId) {
-  const ids = (env.TELEGRAM_ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  return ids.includes(String(telegramId));
-}
-
-// Sends the receipt photo to every admin with APPROVE / REJECT buttons.
-async function sendPaymentReview(env, payment, student, receiptBlob) {
-  const caption =
-    'BDU PREMIUM — PAYMENT REVIEW\n\n' +
-    `Student: ${student.full_name}\n` +
-    `University: ${student.university}\n` +
-    `Campus: ${student.campus}\n` +
-    `Phone: ${student.phone}\n` +
-    `Method: ${payment.method}\n` +
-    `Reference: ${payment.reference}\n` +
-    `Payment ID: ${payment.id}\n` +
-    `Submitted: ${payment.created_at}`;
-
-  const keyboard = {
-    inline_keyboard: [[
-      { text: 'APPROVE', callback_data: `approve:${payment.id}` },
-      { text: 'REJECT', callback_data: `reject:${payment.id}` },
-    ]],
-  };
-
-  const admins = (env.TELEGRAM_ADMIN_IDS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  for (const adminId of admins) {
-    const form = new FormData();
-    form.append('chat_id', adminId);
-    form.append('caption', caption);
-    form.append('reply_markup', JSON.stringify(keyboard));
-    form.append('photo', receiptBlob, 'receipt.jpg');
-    await fetch(api(env, 'sendPhoto'), { method: 'POST', body: form });
-  }
-}
-
-async function answerCallback(env, callbackId, text) {
-  await fetch(api(env, 'answerCallbackQuery'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: callbackId, text, show_alert: false }),
-  });
-}
-
-// Removes the buttons once a decision is made, so nobody can press them twice.
-async function markDecided(env, chatId, messageId, decisionText) {
-  await fetch(api(env, 'editMessageCaption'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      message_id: messageId,
-      caption: decisionText,
-      reply_markup: { inline_keyboard: [] },
-    }),
-  });
-}
-
-// BDU PREMIUM — payments (Phase 2)
-// Flow: student uploads receipt -> saved in D1 (pending) -> admin gets Telegram message
-//       -> admin taps APPROVE or REJECT -> D1 updated -> entitlement granted if approved.
-
-// Payment methods students can choose. Add/remove names here.
-const METHODS = ['telebirr', 'cbe_birr', 'cbe_bank', 'bank_transfer'];
-const MAX_RECEIPT_BYTES = 1024 * 1024; // 1 MB (receipts are stored inside the database)
-
-// Converts image bytes to text so they can be stored in a database column.
-function bytesToBase64(bytes) {
-  let binary = '';
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
-// Only real image files are accepted. We check the file's first bytes, not just its name.
-function detectImageType(bytes) {
-  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return { ext: 'jpg', mime: 'image/jpeg' };
-  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return { ext: 'png', mime: 'image/png' };
-  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
-      bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return { ext: 'webp', mime: 'image/webp' };
-  return null;
-}
-
-// POST /api/receipt  (multipart form: method, reference, receipt=<image file>)
-async function submitReceipt(request, env, cors, user) {
-  if (!user) return json({ ok: false, error: 'Please log in first.' }, 401, cors);
-  if (!await allowRequest(env.DB, `receipt:${user.id}`, 5, 3600)) {
-    return json({ ok: false, error: 'Too many submissions. Try again later.' }, 429, cors);
-  }
-
-  const existing = await env.DB.prepare('SELECT premium FROM entitlements WHERE user_id = ?').bind(user.id).first();
-  if (existing?.premium === 1) return json({ ok: false, error: 'You already have premium access.' }, 409, cors);
-
-  const pending = await env.DB.prepare(
-    "SELECT id FROM payments WHERE user_id = ? AND status = 'pending'"
-  ).bind(user.id).first();
-  if (pending) return json({ ok: false, error: 'You already have a payment waiting for review.' }, 409, cors);
-
-  let form;
-  try { form = await request.formData(); } catch { return json({ ok: false, error: 'Invalid upload.' }, 400, cors); }
-
-  const method = String(form.get('method') || '');
-  const reference = String(form.get('reference') || '').trim();
-  const file = form.get('receipt');
-
-  if (!METHODS.includes(method)) return json({ ok: false, error: 'Choose a valid payment method.' }, 400, cors);
-  if (!/^[A-Za-z0-9]{4,40}$/.test(reference)) {
-    return json({ ok: false, error: 'Enter the transaction reference (letters and numbers only).' }, 400, cors);
   }
   if (!file || typeof file === 'string') return json({ ok: false, error: 'Attach a receipt image.' }, 400, cors);
   if (file.size === 0 || file.size > MAX_RECEIPT_BYTES) {
@@ -285,58 +131,6 @@ async function telegramWebhook(request, env) {
   if (!cb) return new Response('ok');
 
   if (!isAdmin(env, cb.from.id)) {
-    await answerCallback(env, cb.id, 'You are not authorized.');
-    return new Response('ok');
-  }
-
-  const [action, paymentId] = String(cb.data || '').split(':');
-  if (!paymentId || !['approve', 'reject'].includes(action)) {
-    await answerCallback(env, cb.id, 'Unknown action.');
-    return new Response('ok');
-  }
-
-  const newStatus = action === 'approve' ? 'approved' : 'rejected';
-  const adminId = String(cb.from.id);
-
-  // Only a pending payment can be decided. A second press changes nothing.
-  const result = await env.DB.prepare(
-    "UPDATE payments SET status = ?, decided_by = ?, decided_at = datetime('now') WHERE id = ? AND status = 'pending'"
-  ).bind(newStatus, adminId, paymentId).run();
-
-  if (!result.meta || result.meta.changes !== 1) {
-    await answerCallback(env, cb.id, 'Already decided or not found.');
-    return new Response('ok');
-  }
-
-  if (newStatus === 'approved') {
-    const row = await env.DB.prepare('SELECT user_id FROM payments WHERE id = ?').bind(paymentId).first();
-    await env.DB.prepare(
-      `INSERT INTO entitlements (user_id, premium, granted_by_payment, updated_at)
-       VALUES (?, 1, ?, datetime('now'))
-       ON CONFLICT(user_id) DO UPDATE SET premium = 1, granted_by_payment = excluded.granted_by_payment, updated_at = datetime('now')`
-    ).bind(row.user_id, paymentId).run();
-  }
-
-  const label = newStatus === 'approved' ? 'APPROVED' : 'REJECTED';
-  await answerCallback(env, cb.id, `Payment ${label}.`);
-  await markDecided(env, cb.message.chat.id, cb.message.message_id, `BDU PREMIUM — ${label} by admin ${adminId}`);
-  return new Response('ok');
-}
-
-
-// BDU PREMIUM — Cloudflare Worker API (Phase 1: auth, content, premium checks)
-
-// Only your own front-end origins may call the API from a browser.
-// Set ALLOWED_ORIGINS in wrangler.toml [vars], comma-separated.
-function corsHeaders(request, env) {
-  const origin = request.headers.get('Origin') || '';
-  const allowed = (env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const headers = {
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Vary': 'Origin',
-  };
-  if (allowed.includes(origin)) headers['Access-Control-Allow-Origin'] = origin;
   return headers;
 }
 
@@ -400,12 +194,6 @@ async function login(request, env, cors) {
   if (!await allowRequest(env.DB, `login:${clientIp(request)}`, 10, 900)) {
     return fail(429, 'Too many login attempts. Try again in 15 minutes.', cors);
   }
-  const body = await readJson(request);
-  const phone = normalizePhone(body?.phone);
-  const password = String(body?.password || '');
-  if (!phone || !password) return fail(400, 'Phone and password are required.', cors);
-
-  const user = await env.DB.prepare(
     'SELECT id, full_name, password_hash, is_suspended FROM users WHERE phone = ?'
   ).bind(phone).first();
   // Same message whether the phone exists or not, to avoid account enumeration.
@@ -507,28 +295,29 @@ export default {
       const isPost = request.method === 'POST';
 
       // Auth
-      if (isPost && path === '/api/auth/signup') return signup(request, env, cors);
-      if (isPost && path === '/api/auth/login') return login(request, env, cors);
-      if (isPost && path === '/api/auth/logout') return logout(request, env, cors);
+      // NOTE: every handler is "await"-ed so that errors reach the catch block below.
+      if (isPost && path === '/api/auth/signup') return await signup(request, env, cors);
+      if (isPost && path === '/api/auth/login') return await login(request, env, cors);
+      if (isPost && path === '/api/auth/logout') return await logout(request, env, cors);
 
       // Public content
-      if (isGet && path === '/api/version') return getVersion(env, cors);
-      if (isGet && path === '/api/programs') return getPrograms(env, cors);
+      if (isGet && path === '/api/version') return await getVersion(env, cors);
+      if (isGet && path === '/api/programs') return await getPrograms(env, cors);
 
       // Telegram calls this directly. It is protected by its own secret header, not a login token.
-      if (isPost && path === '/api/telegram/webhook') return telegramWebhook(request, env);
+      if (isPost && path === '/api/telegram/webhook') return await telegramWebhook(request, env);
 
       // Routes below use the logged-in user if a valid token is sent (optional for reads).
       const user = await getUserFromRequest(env.DB, request);
 
       // Payments (login required)
-      if (isPost && path === '/api/receipt') return submitReceipt(request, env, cors, user);
-      if (isGet && path === '/api/payment/status') return paymentStatus(env, cors, user);
+      if (isPost && path === '/api/receipt') return await submitReceipt(request, env, cors, user);
+      if (isGet && path === '/api/payment/status') return await paymentStatus(env, cors, user);
 
-      if (isGet && path === '/api/courses') return getCourses(url, env, cors);
-      if (isGet && path === '/api/chapters') return getChapters(url, env, cors, user);
-      if (isGet && path === '/api/notes') return getNotes(url, env, cors, user);
-      if (isGet && path === '/api/premium/status') return premiumStatus(env, cors, user);
+      if (isGet && path === '/api/courses') return await getCourses(url, env, cors);
+      if (isGet && path === '/api/chapters') return await getChapters(url, env, cors, user);
+      if (isGet && path === '/api/notes') return await getNotes(url, env, cors, user);
+      if (isGet && path === '/api/premium/status') return await premiumStatus(env, cors, user);
 
       return fail(404, 'Not found.', cors);
     } catch (err) {
